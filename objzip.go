@@ -5,82 +5,90 @@ import (
 	"context"
 	"io"
 
+	"github.com/aws/aws-sdk-go-v2/feature/s3/manager"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/aws/smithy-go/ptr"
+	"github.com/pkg/errors"
 )
 
 type Client struct {
-	s3Client PutGetter
-}
-
-type PutGetter interface {
-	Putter
-	Getter
-}
-
-type Putter interface {
-	PutObject(ctx context.Context, params *s3.PutObjectInput, optFns ...func(*s3.Options)) (*s3.PutObjectOutput, error)
+	getter   Getter
+	uploader Uploader
 }
 
 type Getter interface {
 	GetObject(ctx context.Context, params *s3.GetObjectInput, optFns ...func(*s3.Options)) (*s3.GetObjectOutput, error)
 }
 
-func New(p PutGetter) *Client {
-	return &Client{s3Client: p}
+// Uploader is the upload component of the S3 client.
+// uploader := manager.NewUploader(s3Client)
+type Uploader interface {
+	Upload(ctx context.Context, input *s3.PutObjectInput, opts ...func(*manager.Uploader)) (*manager.UploadOutput, error)
 }
 
-func (c *Client) Put(ctx context.Context, body io.Reader, bucket, key string) error {
-	pr, pw := io.Pipe()
-	errChan := make(chan error)
-	go func() {
-		defer close(errChan)
-		gw := gzip.NewWriter(pw)
-		_, err := io.Copy(gw, body)
-		if err != nil {
-			errChan <- err
-			return
-		}
-		err = gw.Close()
-		if err != nil {
-			errChan <- err
-			return
-		}
-		err = pw.Close()
-		if err != nil {
-			errChan <- err
-			return
-		}
-	}()
-	_, err := c.s3Client.PutObject(ctx, &s3.PutObjectInput{
-		Bucket: &bucket,
-		Key:    &key,
-		Body:   pr,
-	})
-	if err != nil {
-		return err
+func New(g Getter, u Uploader) *Client {
+	return &Client{
+		getter:   g,
+		uploader: u,
 	}
-	return <-errChan
 }
 
-type readCloser struct {
-	io.Reader
-	io.Closer
-}
-
-func (c *Client) Get(ctx context.Context, bucket, key string) (io.ReadCloser, error) {
-	out, err := c.s3Client.GetObject(context.Background(), &s3.GetObjectInput{
-		Bucket: &bucket,
-		Key:    &key,
+func (c *Client) ReadAndUnzip(ctx context.Context, bucket, key string) (io.ReadCloser, error) {
+	out, err := c.getter.GetObject(context.Background(), &s3.GetObjectInput{
+		Bucket: ptr.String(bucket),
+		Key:    ptr.String(key),
 	})
 	if err != nil {
 		return nil, err
 	}
+	wantZipped := true
+	if !wantZipped {
+		return out.Body, nil
+	}
+
 	zipReader, err := gzip.NewReader(out.Body)
 	if err != nil {
 		return nil, err
 	}
-	return &readCloser{
+
+	return struct {
+		io.Reader
+		io.Closer
+	}{
 		Reader: zipReader,
 		Closer: out.Body,
 	}, nil
+}
+
+func (c *Client) ZipAndWrite(ctx context.Context, bucket, key string, rc io.Reader) error {
+	pipeR, pipeW := io.Pipe()
+	errCh := make(chan error, 1)
+	go func() {
+		defer close(errCh)
+		compressed := gzip.NewWriter(pipeW)
+		if _, err := io.Copy(compressed, rc); err != nil {
+			errCh <- errors.Wrap(err, "failed to copy to gzip writer")
+			return
+		}
+		if err := compressed.Close(); err != nil {
+			errCh <- err
+			return
+		}
+		if err := pipeW.Close(); err != nil {
+			errCh <- err
+			return
+		}
+	}()
+
+	if _, uploadErr := c.uploader.Upload(ctx, &s3.PutObjectInput{
+		Bucket: ptr.String(bucket),
+		Key:    ptr.String(key),
+		Body:   pipeR,
+	}); uploadErr != nil {
+		return uploadErr
+	}
+	if err := pipeR.Close(); err != nil {
+		return err
+	}
+	return <-errCh
 }
